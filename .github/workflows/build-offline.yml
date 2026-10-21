@@ -1,0 +1,1018 @@
+name: Build MIRO Offline
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_ref:
+        description: "项目分支/tag/commit；留空使用下方固定 commit"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: miro-offline-${{ github.repository }}
+  cancel-in-progress: false
+
+# 项目配置集中在这里。
+# 本文件仅适用于已核对的 MIRO commit。
+# 更换项目时，必须重新核对依赖、补丁和验证代码。
+env:
+  PROJECT_URL: "https://github.com/DeepTrackAI/MIRO.git"
+  PROJECT_REF: "ed2b318b8015f47c47841b18c55a9fea8ef83982"
+  AUDITED_PROJECT_SHA: "ed2b318b8015f47c47841b18c55a9fea8ef83982"
+  DATASET_URL: "https://github.com/DJ-Nieves/ARI-and-IoU-cluster-analysis-evaluation.git"
+  DATASET_REF: "3b0580b428ae316207cc2fb1ee89345851fc53ed"
+  PYTHON_VERSION: "3.11.11"
+  MINIFORGE_VERSION: "25.3.1-0"
+  MINIFORGE_SHA256: "376b160ed8130820db0ab0f3826ac1fc85923647f75c1b8231166e3d559ab768"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout packaging repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Build and verify offline packages
+        env:
+          REQUESTED_REF: ${{ inputs.project_ref }}
+        run: |
+          set -euo pipefail
+
+          # Ubuntu 24.04 / x86_64 / glibc 2.39。
+          [[ "$(uname -m)" == "x86_64" ]]
+          [[ "$(getconf GNU_LIBC_VERSION)" == "glibc 2.39" ]]
+          source /etc/os-release
+          [[ "$ID" == "ubuntu" && "$VERSION_ID" == "24.04" ]]
+
+          unset PYTHONHOME PYTHONPATH LD_PRELOAD LD_LIBRARY_PATH
+          unset PIP_NO_INDEX PIP_FIND_LINKS PIP_REQUIRE_VIRTUALENV
+
+          export PYTHONNOUSERSITE=1
+          export PYTHONDONTWRITEBYTECODE=1
+          export PIP_NO_CACHE_DIR=1
+          export PIP_DISABLE_PIP_VERSION_CHECK=1
+          export GIT_TERMINAL_PROMPT=0
+          export OMP_NUM_THREADS=2
+          export OPENBLAS_NUM_THREADS=2
+          export TORCH_CUDA_ARCH_LIST="8.6"
+          export LC_ALL=C
+
+          WORK_DIR="$RUNNER_TEMP/miro-offline-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          STAGE_DIR="$WORK_DIR/stage"
+          SOURCE_DIR="$STAGE_DIR/source"
+          ENV_DIR="$STAGE_DIR/env"
+          META_DIR="$WORK_DIR/versions"
+          BOOTSTRAP_DIR="$WORK_DIR/miniforge"
+          OUT_DIR="$GITHUB_WORKSPACE/dist"
+
+          test ! -e "$WORK_DIR"
+          test ! -e "$OUT_DIR"
+
+          mkdir -p "$STAGE_DIR" "$META_DIR" "$OUT_DIR" "$WORK_DIR/tmp"
+          export TMPDIR="$WORK_DIR/tmp"
+          export CONDA_PKGS_DIRS="$WORK_DIR/conda-pkgs"
+
+          trap 'df -h "$RUNNER_TEMP"; du -sh "$WORK_DIR" "$OUT_DIR" 2>/dev/null || true' EXIT
+
+          disk_check() {
+            local required_gib="$1"
+            local available_bytes
+            available_bytes="$(df -B1 --output=avail "$WORK_DIR" | tail -n 1)"
+            df -h "$WORK_DIR"
+            if (( available_bytes < required_gib * 1024 * 1024 * 1024 )); then
+              echo "磁盘不足：当前阶段要求至少 ${required_gib} GiB 可用空间" >&2
+              exit 1
+            fi
+          }
+
+          disk_check 12
+
+          git --version
+          git lfs version
+
+          clone_tree() {
+            local url="$1"
+            local ref="$2"
+            local destination="$3"
+
+            mkdir -p "$destination"
+            git init -q "$destination"
+            git -C "$destination" remote add origin "$url"
+            git -C "$destination" fetch --depth=1 --no-tags origin "$ref"
+
+            GIT_LFS_SKIP_SMUDGE=1 \
+              git -C "$destination" checkout --detach FETCH_HEAD
+            GIT_LFS_SKIP_SMUDGE=1 \
+              git -C "$destination" submodule update \
+                --init --recursive --depth=1
+
+            git -C "$destination" lfs install --local
+            git -C "$destination" lfs pull
+            git -C "$destination" lfs fsck
+
+            git -C "$destination" submodule foreach --recursive \
+              'git lfs install --local && git lfs pull && git lfs fsck'
+          }
+
+          echo "::group::Fetch project and offline resources"
+
+          BUILD_REF="${REQUESTED_REF:-$PROJECT_REF}"
+          [[ -n "$BUILD_REF" && "$BUILD_REF" != -* ]]
+          [[ "$BUILD_REF" != *[[:space:]]* ]]
+
+          clone_tree "$PROJECT_URL" "$BUILD_REF" "$SOURCE_DIR"
+          PROJECT_SHA="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
+
+          if [[ "$PROJECT_SHA" != "$AUDITED_PROJECT_SHA" ]]; then
+            echo "项目 SHA 尚未核对：$PROJECT_SHA" >&2
+            echo "停止构建，请重新核对该版本的依赖与示例。" >&2
+            exit 1
+          fi
+
+          git -C "$SOURCE_DIR" submodule status --recursive \
+            > "$META_DIR/submodules.txt"
+          git -C "$SOURCE_DIR" lfs ls-files \
+            > "$META_DIR/project-lfs.txt"
+          git -C "$SOURCE_DIR" ls-files --stage \
+            > "$META_DIR/project-git-files.txt"
+
+          clone_tree \
+            "$DATASET_URL" "$DATASET_REF" \
+            "$SOURCE_DIR/offline-resources/dataset"
+
+          DATASET_SHA="$(
+            git -C "$SOURCE_DIR/offline-resources/dataset" rev-parse HEAD
+          )"
+
+          git -C "$SOURCE_DIR/offline-resources/dataset" lfs ls-files \
+            > "$META_DIR/dataset-lfs.txt"
+
+          cp "$SOURCE_DIR/requirements.txt" "$META_DIR/requirements-original.txt"
+          cp "$GITHUB_WORKSPACE/.github/workflows/build-offline.yml" \
+            "$META_DIR/build-offline.yml"
+
+          mkdir -p "$SOURCE_DIR/offline"
+
+          cat > "$SOURCE_DIR/offline/requirements.txt" <<'REQ'
+          torch==2.5.1+cu121
+          torchvision==0.20.1+cu121
+          nvidia-nvjitlink-cu12==12.1.105
+          numpy==1.26.4
+          matplotlib==3.9.2
+          lightning==2.4.0
+          pytorch-lightning==2.4.0
+          torchmetrics==1.4.3
+          torch-geometric==2.6.1
+          kornia==0.7.3
+          kornia-rs==0.1.7
+          scipy==1.14.1
+          scikit-image==0.24.0
+          scikit-learn==1.5.2
+          rich==13.9.4
+          dill==0.3.9
+          pandas==2.2.3
+          tqdm==4.67.1
+          requests==2.32.3
+          fsspec==2024.10.0
+          ipywidgets==8.1.5
+          ipykernel==6.29.5
+          jupyterlab==4.3.4
+          REQ
+
+          cat > "$STAGE_DIR/activate.sh" <<'SH'
+          #!/usr/bin/env bash
+
+          export MIRO_ROOT
+          MIRO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+          if declare -F conda >/dev/null; then
+            conda activate "$MIRO_ROOT/env"
+          else
+            source "$MIRO_ROOT/env/bin/activate"
+          fi
+
+          unset PYTHONHOME PYTHONPATH CUDA_HOME CUDA_PATH LD_PRELOAD
+          export PYTHONNOUSERSITE=1
+          export PYTHONDONTWRITEBYTECODE=1
+          export PIP_NO_INDEX=1
+          export PIP_DISABLE_PIP_VERSION_CHECK=1
+          export MPLBACKEND=Agg
+          export MIRO_OFFLINE=1
+
+          _miro_dirs=("$MIRO_ROOT/env/lib")
+          for _miro_dir in \
+            "$MIRO_ROOT"/env/lib/python*/site-packages/torch/lib \
+            "$MIRO_ROOT"/env/lib/python*/site-packages/nvidia/*/lib
+          do
+            if [[ -d "$_miro_dir" ]]; then
+              _miro_dirs+=("$_miro_dir")
+            fi
+          done
+
+          LD_LIBRARY_PATH="$(IFS=:; printf '%s' "${_miro_dirs[*]}")"
+          export LD_LIBRARY_PATH
+          unset _miro_dirs _miro_dir
+
+          export XDG_CACHE_HOME="$MIRO_ROOT/cache"
+          export TORCH_HOME="$MIRO_ROOT/cache/torch"
+          export CUDA_CACHE_PATH="$MIRO_ROOT/cache/cuda"
+          export MPLCONFIGDIR="$MIRO_ROOT/cache/matplotlib"
+          export TMPDIR="$MIRO_ROOT/tmp"
+
+          mkdir -p \
+            "$XDG_CACHE_HOME" "$TORCH_HOME" "$CUDA_CACHE_PATH" \
+            "$MPLCONFIGDIR" "$TMPDIR"
+          SH
+
+          cp "$STAGE_DIR/activate.sh" "$OUT_DIR/activate.sh"
+
+          cat > "$SOURCE_DIR/offline/elfcheck.py" <<'PY'
+          import argparse
+          import hashlib
+          import re
+          import shutil
+          import subprocess
+          from pathlib import Path
+
+          parser = argparse.ArgumentParser()
+          parser.add_argument("prefix")
+          parser.add_argument("--bundle", action="store_true")
+          args = parser.parse_args()
+          prefix = Path(args.prefix).resolve()
+
+          glibc_names = {
+              "libc.so.6", "libm.so.6", "libmvec.so.1",
+              "libdl.so.2", "libpthread.so.0", "librt.so.1",
+              "libresolv.so.2", "libutil.so.1", "libanl.so.1",
+              "libBrokenLocale.so.1", "libthread_db.so.1",
+              "ld-linux-x86-64.so.2",
+          }
+          driver_pattern = re.compile(
+              r"^(libcuda\.so(?:\..*)?|libnvidia-.*\.so(?:\..*)?|"
+              r"libnvcuvid\.so(?:\..*)?)$"
+          )
+
+          def is_elf(path):
+              try:
+                  with path.open("rb") as handle:
+                      return handle.read(4) == b"\x7fELF"
+              except OSError:
+                  return False
+
+          def save_system_docs(path):
+              result = subprocess.run(
+                  ["dpkg-query", "-S", str(path)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.DEVNULL,
+                  text=True,
+                  check=False,
+              )
+              if result.returncode != 0:
+                  return
+              package = result.stdout.split(": /", 1)[0].strip()
+              package = package.split(":")[0]
+              docs = Path("/usr/share/doc") / package
+              if docs.is_dir():
+                  destination = (
+                      prefix / "share" / "offline-system-library-docs" / package
+                  )
+                  shutil.copytree(
+                      docs, destination,
+                      dirs_exist_ok=True, symlinks=False,
+                  )
+
+          reported = set()
+
+          for round_number in range(8):
+              copied = 0
+              errors = []
+              elf_files = set()
+
+              for path in prefix.rglob("*"):
+                  if path.is_symlink():
+                      if not path.resolve().is_relative_to(prefix):
+                          errors.append(
+                              f"外部符号链接：{path} -> {path.resolve()}"
+                          )
+                  if path.is_file() and is_elf(path):
+                      elf_files.add(path.resolve())
+
+              for path in sorted(elf_files):
+                  if driver_pattern.fullmatch(path.name):
+                      errors.append(f"禁止打包 NVIDIA 驱动库：{path}")
+                      continue
+
+                  result = subprocess.run(
+                      ["ldd", str(path)],
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      text=True,
+                      check=False,
+                  )
+
+                  if result.returncode != 0 and not any(
+                      text in result.stdout
+                      for text in ("not a dynamic executable", "statically linked")
+                  ):
+                      errors.append(
+                          f"ldd 检查失败：{path}\n{result.stdout}"
+                      )
+
+                  for line in result.stdout.splitlines():
+                      if "not found" in line:
+                          name = line.strip().split()[0]
+                          if driver_pattern.fullmatch(name):
+                              message = f"HOST_DRIVER_REQUIRED {name}"
+                              if message not in reported:
+                                  print(message)
+                                  reported.add(message)
+                          else:
+                              errors.append(f"{path}: {line.strip()}")
+                          continue
+
+                      match = re.match(r"\s*(\S+)\s+=>\s+(/\S+)", line)
+                      if not match:
+                          continue
+
+                      name, resolved = match.groups()
+                      dependency = Path(resolved).resolve()
+
+                      if dependency.is_relative_to(prefix):
+                          continue
+
+                      if (
+                          name in glibc_names
+                          or name.startswith("libnss_")
+                          or driver_pattern.fullmatch(name)
+                      ):
+                          message = f"HOST_LIBRARY {name} {dependency}"
+                          if message not in reported:
+                              print(message)
+                              reported.add(message)
+                          continue
+
+                      if not args.bundle:
+                          errors.append(
+                              f"{path}: 仍依赖环境外动态库 "
+                              f"{name} -> {dependency}"
+                          )
+                          continue
+
+                      destination = prefix / "lib" / name
+                      if destination.exists() or destination.is_symlink():
+                          errors.append(
+                              f"动态库冲突或不可迁移路径："
+                              f"{name} -> {dependency}"
+                          )
+                          continue
+
+                      shutil.copy2(dependency, destination)
+                      save_system_docs(dependency)
+                      digest = hashlib.sha256(
+                          destination.read_bytes()
+                      ).hexdigest()
+                      print(
+                          f"BUNDLED {name} {dependency} SHA256={digest}"
+                      )
+                      copied += 1
+
+              if errors:
+                  raise RuntimeError("\n".join(sorted(set(errors))))
+              if copied == 0:
+                  print(f"ELF_CHECK_OK files={len(elf_files)}")
+                  break
+          else:
+              raise RuntimeError("动态库检查未收敛")
+          PY
+
+          cat > "$SOURCE_DIR/offline/smoke.py" <<'PY'
+          import argparse
+          import importlib
+          import json
+          import re
+          import socket
+          import sys
+          from pathlib import Path
+
+          parser = argparse.ArgumentParser()
+          parser.add_argument("--source", required=True)
+          parser.add_argument("--device", choices=("cpu", "cuda"), required=True)
+          parser.add_argument("--max-points", type=int, default=256)
+          parser.add_argument("--output")
+          args = parser.parse_args()
+
+          def deny_network(*unused_args, **unused_kwargs):
+              raise RuntimeError("离线测试禁止网络访问")
+
+          socket.socket.connect = deny_network
+          socket.socket.connect_ex = deny_network
+          socket.create_connection = deny_network
+          socket.getaddrinfo = deny_network
+
+          for name in (
+              "numpy", "matplotlib", "torch", "torchvision",
+              "torch_geometric", "lightning", "pytorch_lightning",
+              "torchmetrics", "kornia", "scipy", "skimage", "sklearn",
+              "rich", "dill", "pandas", "tqdm", "requests",
+              "ipywidgets", "ipykernel",
+          ):
+              importlib.import_module(name)
+
+          import numpy as np
+          import pandas as pd
+          import torch
+          import torchvision
+          import deeplay as dl
+          import lib
+
+          assert sys.version_info[:2] == (3, 11)
+          assert torch.__version__ == "2.5.1+cu121"
+          assert torchvision.__version__ == "0.20.1+cu121"
+          assert torch.version.cuda == "12.1"
+
+          for module in (dl, lib):
+              location = Path(module.__file__).resolve()
+              assert location.is_relative_to(
+                  Path(sys.prefix).resolve()
+              ), location
+              print(f"IMPORT_OK {module.__name__}: {location}")
+
+          torch.set_num_threads(2)
+          torch.manual_seed(0)
+          np.random.seed(0)
+
+          if args.device == "cuda":
+              assert torch.cuda.is_available(), "CUDA 不可用"
+              assert torch.cuda.device_count() > 0
+              assert "sm_86" in torch.cuda.get_arch_list()
+              assert torch.backends.cudnn.is_available()
+
+              for index in range(torch.cuda.device_count()):
+                  gpu = torch.device(f"cuda:{index}")
+                  capability = torch.cuda.get_device_capability(index)
+                  assert capability == (8, 6), capability
+
+                  matrix = torch.ones((512, 512), device=gpu)
+                  product = matrix @ matrix
+                  assert torch.all(product == 512).item()
+
+                  layer = torch.nn.Conv2d(3, 8, 3).to(gpu)
+                  image = torch.randn(1, 3, 32, 32, device=gpu)
+                  output = layer(image)
+                  output.square().mean().backward()
+                  assert torch.isfinite(output).all().item()
+                  torch.cuda.synchronize(index)
+
+                  print(
+                      f"GPU_OK logical={index} "
+                      f"name={torch.cuda.get_device_name(index)} "
+                      f"capability={capability}"
+                  )
+
+              device = torch.device("cuda:0")
+          else:
+              device = torch.device("cpu")
+
+          boxes = torch.tensor([
+              [0., 0., 1., 1.],
+              [0., 0., 2., 2.],
+          ])
+          scores = torch.tensor([0.9, 0.8])
+          assert torchvision.ops.nms(boxes, scores, 0.5).numel() > 0
+
+          source = Path(args.source).resolve()
+          tutorial = source / "single-shot"
+          metadata = json.loads(
+              (tutorial / "metadata.json").read_text(encoding="utf-8")
+          )["Ground Truth - Scenario 6"]
+
+          cluster = pd.read_csv(
+              tutorial / metadata["training_cluster_path"]
+          )
+          builder_options = dict(metadata["builder_kwargs"])
+          builder_options["dataset_size"] = 1
+          builder = getattr(lib, metadata["builder"])(
+              [cluster], **builder_options
+          )
+
+          data_dir = lib.sdownload(
+              id=6,
+              local_folder=str(tutorial / "data"),
+              blinking=False,
+          )
+          number = re.compile(r"\d+")
+          files = sorted(
+              data_dir.glob("*.csv"),
+              key=lambda path: int(number.search(path.name).group()),
+          )
+          excluded = {
+              index - 1 for index in metadata["training_indices"]
+          }
+          sample = next(
+              path for index, path in enumerate(files)
+              if index not in excluded
+          )
+
+          frame = pd.read_csv(sample)
+          if args.max_points > 0 and len(frame) > args.max_points:
+              frame = frame.sample(
+                  n=args.max_points, random_state=0
+              ).reset_index(drop=True)
+
+          graph = lib.compute_test_graph(frame, builder).to(device)
+
+          model = dl.MIRO(
+              num_outputs=2,
+              connectivity_radius=builder.connectivity_radius,
+              num_iterations=metadata["recurrent_iterations"],
+          ).create()
+
+          state = torch.load(
+              tutorial / metadata["checkpoint"],
+              map_location="cpu",
+              weights_only=True,
+          )
+          model.load_state_dict(state, strict=True)
+          model = model.to(device).eval()
+
+          with torch.inference_mode():
+              outputs = model(graph.clone())
+              assert len(outputs) == metadata["recurrent_iterations"]
+              assert outputs[-1].shape == (len(frame), 2)
+              assert torch.isfinite(outputs[-1]).all().item()
+
+              labels = model.clustering(
+                  graph.clone(),
+                  eps=metadata["MIRO_DBSCAN_params"]["eps"],
+                  min_samples=metadata["MIRO_DBSCAN_params"]["min_samples"],
+                  scaling=frame[["x", "y"]].max().to_numpy(),
+              )
+
+          assert labels.shape == (len(frame),)
+          assert np.isfinite(labels).all()
+
+          if args.device == "cuda":
+              torch.cuda.synchronize()
+
+          if args.output:
+              frame["clustering-MIRO"] = labels + 1
+              frame.to_csv(args.output, index=False)
+
+          print(
+              f"MIRO_SMOKE_OK device={device} "
+              f"points={len(frame)} sample={sample.name}"
+          )
+          PY
+
+          python3 - "$SOURCE_DIR" <<'PY'
+          import json
+          import os
+          import shutil
+          import sys
+          from pathlib import Path
+
+          source = Path(sys.argv[1]).resolve()
+          dataset = source / "offline-resources" / "dataset"
+
+          for relative in (
+              "deeplay/__init__.py",
+              "lib/__init__.py",
+              "lib/download.py",
+              "single-shot/metadata.json",
+              "single-shot/models/single_shot_model_scenario_6.pt",
+          ):
+              if not (source / relative).is_file():
+                  raise RuntimeError(f"缺少项目文件：{relative}")
+
+          for path in list(source.rglob("__pycache__")):
+              if ".git" not in path.parts:
+                  shutil.rmtree(path)
+          for path in list(source.rglob("*.pyc")):
+              if ".git" not in path.parts:
+                  path.unlink(missing_ok=True)
+
+          for path in source.rglob("*"):
+              if ".git" in path.parts or not path.is_file():
+                  continue
+              with path.open("rb") as handle:
+                  header = handle.read(128)
+              if header.startswith(
+                  b"version https://git-lfs.github.com/spec/v1"
+              ):
+                  raise RuntimeError(f"未下载的 LFS 文件：{path}")
+
+          scenario_dirs = [
+              path for path in dataset.iterdir()
+              if path.is_dir()
+              and (
+                  path.name.startswith("Ground Truth - Scenario ")
+                  or path.name.startswith("Multiple Blinking - Scenario ")
+              )
+          ]
+          if not (dataset / "Ground Truth - Scenario 6").is_dir():
+              raise RuntimeError("缺少 Scenario 6 数据")
+          if not scenario_dirs:
+              raise RuntimeError("缺少教程数据目录")
+
+          for tutorial in ("benchmark", "single-shot"):
+              target = source / tutorial / "data"
+              target.mkdir(parents=True, exist_ok=True)
+              for scenario in scenario_dirs:
+                  link = target / scenario.name
+                  if link.exists() or link.is_symlink():
+                      raise RuntimeError(f"目标已存在：{link}")
+                  link.symlink_to(
+                      os.path.relpath(scenario, target),
+                      target_is_directory=True,
+                  )
+
+          (source / "lib" / "download.py").write_text(
+              '''from pathlib import Path
+          from typing import Optional
+
+
+          def sdownload(
+              id: int,
+              local_folder: str,
+              blinking: bool = False,
+              branch: str = "main",
+              token: Optional[str] = None,
+          ) -> Path:
+              basename = "Multiple Blinking" if blinking else "Ground Truth"
+              target = Path(local_folder) / f"{basename} - Scenario {id}"
+              if not target.is_dir() or not any(target.glob("*.csv")):
+                  raise FileNotFoundError(
+                      f"离线数据不存在或不完整：{target.resolve()}"
+                  )
+              return target.resolve()
+          ''',
+              encoding="utf-8",
+          )
+
+          for notebook in source.glob("*/tutorial.ipynb"):
+              document = json.loads(
+                  notebook.read_text(encoding="utf-8")
+              )
+              for cell in document["cells"]:
+                  if cell["cell_type"] != "code":
+                      continue
+                  code = "".join(cell["source"])
+                  code = code.replace(
+                      "from torch_geometric.data import DataLoader",
+                      "from torch_geometric.loader import DataLoader",
+                  )
+                  code = code.replace(
+                      'torch.load(metadata["checkpoint"])',
+                      'torch.load(metadata["checkpoint"], '
+                      'map_location="cpu", weights_only=True)',
+                  )
+                  code = code.replace(
+                      'torch.load("models/checkpoint.pt")',
+                      'torch.load("models/checkpoint.pt", '
+                      'map_location="cpu", weights_only=True)',
+                  )
+                  code = code.replace(
+                      'torch.load("data/test_graph.pt")',
+                      'torch.load("data/test_graph.pt", '
+                      'map_location="cpu", weights_only=False)',
+                  )
+                  cell["source"] = code.splitlines(keepends=True)
+                  cell["outputs"] = []
+                  cell["execution_count"] = None
+
+              notebook.write_text(
+                  json.dumps(
+                      document, ensure_ascii=False, indent=1
+                  ) + "\n",
+                  encoding="utf-8",
+              )
+
+          for name in ("pyproject.toml", "setup.py", "setup.cfg"):
+              if (source / name).exists():
+                  raise RuntimeError(
+                      f"安装配置已变化，需要重新核对：{name}"
+                  )
+
+          (source / "pyproject.toml").write_text(
+              '''[build-system]
+          requires = ["setuptools==75.6.0", "wheel==0.45.1"]
+          build-backend = "setuptools.build_meta"
+
+          [project]
+          name = "miro-offline-local"
+          version = "0.0.0"
+          requires-python = ">=3.9"
+
+          [tool.setuptools.packages.find]
+          where = ["."]
+          include = ["deeplay*", "lib*"]
+          exclude = ["deeplay.tests*"]
+          ''',
+              encoding="utf-8",
+          )
+
+          shutil.copyfile(
+              source / "offline" / "requirements.txt",
+              source / "requirements.txt",
+          )
+          print("PREPARE_OK")
+          PY
+
+          git -C "$SOURCE_DIR" diff --binary \
+            > "$META_DIR/project-modifications.patch"
+          cp "$SOURCE_DIR/offline/requirements.txt" \
+            "$META_DIR/requirements-selected.txt"
+
+          echo "::endgroup::"
+
+          echo "::group::Create Conda environment"
+
+          INSTALLER="Miniforge3-${MINIFORGE_VERSION}-Linux-x86_64.sh"
+          INSTALLER_URL="https://github.com/conda-forge/miniforge/releases/download/${MINIFORGE_VERSION}/${INSTALLER}"
+
+          curl --fail --location --retry 3 \
+            "$INSTALLER_URL" -o "$WORK_DIR/$INSTALLER"
+
+          printf '%s  %s\n' \
+            "$MINIFORGE_SHA256" "$WORK_DIR/$INSTALLER" \
+            | sha256sum -c -
+
+          bash "$WORK_DIR/$INSTALLER" -b -p "$BOOTSTRAP_DIR"
+          rm "$WORK_DIR/$INSTALLER"
+
+          source "$BOOTSTRAP_DIR/etc/profile.d/conda.sh"
+
+          conda create --yes \
+            --override-channels --channel conda-forge \
+            --strict-channel-priority \
+            --prefix "$ENV_DIR" \
+            "python=$PYTHON_VERSION" \
+            "pip=24.3.1" \
+            "setuptools=75.6.0" \
+            "wheel=0.45.1" \
+            "conda-pack=0.8.1" \
+            "libgcc-ng=13" \
+            "libstdcxx-ng=13" \
+            "libgomp=13"
+
+          conda clean --tarballs --index-cache --yes
+          conda activate "$ENV_DIR"
+
+          # 当前 MIRO 无需 CUDA 扩展编译。
+          # PyTorch 使用 CUDA 12.1 GPU wheel；不使用服务器 nvcc 12.0。
+          python -m pip install --only-binary=:all: \
+            --index-url https://pypi.org/simple \
+            "nvidia-nvjitlink-cu12==12.1.105"
+
+          python -m pip install --only-binary=:all: \
+            --index-url https://download.pytorch.org/whl/cu121 \
+            "torch==2.5.1+cu121" \
+            "torchvision==0.20.1+cu121"
+
+          python -m pip install --only-binary=:all: \
+            --index-url https://pypi.org/simple \
+            --requirement "$SOURCE_DIR/offline/requirements.txt"
+
+          mkdir -p "$WORK_DIR/wheels"
+
+          python -m pip wheel \
+            --no-deps --no-build-isolation \
+            --wheel-dir "$WORK_DIR/wheels" \
+            "$SOURCE_DIR"
+
+          python -m pip install --no-deps --no-index \
+            "$WORK_DIR"/wheels/*.whl
+
+          find "$ENV_DIR"/lib/python*/site-packages/miro_offline_local-0.0.0.dist-info \
+            -name direct_url.json -delete
+
+          rm -rf "$WORK_DIR/wheels"
+
+          source "$STAGE_DIR/activate.sh"
+          cd "$WORK_DIR"
+
+          if find "$ENV_DIR" -name '*.egg-link' -print -quit | grep -q .; then
+            echo "发现 editable 安装，停止打包" >&2
+            exit 1
+          fi
+
+          python -m pip check \
+            | tee "$META_DIR/pip-check.txt"
+          python -m pip freeze --all \
+            > "$META_DIR/pip-freeze.txt"
+          python -m pip inspect --local \
+            > "$META_DIR/pip-inspect.json"
+
+          conda list --prefix "$ENV_DIR" --explicit \
+            > "$META_DIR/conda-explicit.txt"
+          conda list --prefix "$ENV_DIR" --json \
+            > "$META_DIR/conda-packages.json"
+
+          echo "::endgroup::"
+
+          echo "::group::Audit native libraries and run CPU test"
+
+          python "$SOURCE_DIR/offline/elfcheck.py" \
+            "$ENV_DIR" --bundle \
+            | tee "$META_DIR/elf-bundle.txt"
+
+          python "$SOURCE_DIR/offline/elfcheck.py" \
+            "$ENV_DIR" \
+            | tee "$META_DIR/elf-check.txt"
+
+          CUDA_VISIBLE_DEVICES="" \
+            python "$SOURCE_DIR/offline/smoke.py" \
+              --source "$SOURCE_DIR" \
+              --device cpu \
+              --max-points 256 \
+            | tee "$META_DIR/cpu-before-pack.txt"
+
+          {
+            printf 'BUILD_UTC=%s\n' "$(date -u +%FT%TZ)"
+            printf 'PROJECT_URL=%s\n' "$PROJECT_URL"
+            printf 'REQUESTED_REF=%s\n' "$BUILD_REF"
+            printf 'PROJECT_SHA=%s\n' "$PROJECT_SHA"
+            printf 'DATASET_URL=%s\n' "$DATASET_URL"
+            printf 'DATASET_SHA=%s\n' "$DATASET_SHA"
+            printf 'PACKAGING_REPOSITORY=%s\n' "$GITHUB_REPOSITORY"
+            printf 'PACKAGING_SHA=%s\n' "$GITHUB_SHA"
+            printf 'RUN_URL=https://github.com/%s/actions/runs/%s\n' \
+              "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            printf 'RUNNER_IMAGE_VERSION=%s\n' "${ImageVersion:-unknown}"
+            printf 'CUDA_EXTENSION_COMPILATION=none\n'
+            printf 'TARGET_CUDA_ARCH=8.6\n'
+            uname -a
+            getconf GNU_LIBC_VERSION
+            cat /etc/os-release
+            python -VV
+            conda --version
+            python -m pip --version
+            python -c \
+              'import torch; print(torch.__config__.show()); print("cuDNN:", torch.backends.cudnn.version())'
+          } > "$META_DIR/VERSIONS.txt"
+
+          (
+            cd "$SOURCE_DIR"
+            find . -type f \
+              -not -path '*/.git/*' \
+              -not -path '*/__pycache__/*' \
+              -not -name '*.pyc' \
+              -print0 \
+              | sort -z \
+              | xargs -0 sha256sum
+          ) > "$META_DIR/source-files.sha256"
+
+          echo "::endgroup::"
+
+          echo "::group::Pack environment and source"
+
+          disk_check 4
+
+          tar \
+            --exclude=.git \
+            --exclude=__pycache__ \
+            --exclude='*.pyc' \
+            -czf "$OUT_DIR/source.tar.gz" \
+            -C "$STAGE_DIR" source
+
+          conda-pack \
+            --prefix "$ENV_DIR" \
+            --output "$OUT_DIR/env.tar.gz" \
+            --compress-level 6 \
+            --n-threads 2
+
+          echo "::endgroup::"
+
+          echo "::group::Verify relocation"
+
+          conda deactivate
+          rm -rf "$ENV_DIR"
+
+          RELOCATED_DIR="$WORK_DIR/relocated"
+          mkdir -p "$RELOCATED_DIR/env"
+
+          cp "$STAGE_DIR/activate.sh" "$RELOCATED_DIR/activate.sh"
+          tar -xzf "$OUT_DIR/env.tar.gz" \
+            -C "$RELOCATED_DIR/env"
+
+          source "$RELOCATED_DIR/activate.sh"
+          python "$RELOCATED_DIR/env/bin/conda-unpack"
+
+          python -m pip check \
+            | tee "$META_DIR/pip-check-relocated.txt"
+
+          python "$SOURCE_DIR/offline/elfcheck.py" \
+            "$RELOCATED_DIR/env" \
+            | tee "$META_DIR/elf-check-relocated.txt"
+
+          CUDA_VISIBLE_DEVICES="" \
+            python "$SOURCE_DIR/offline/smoke.py" \
+              --source "$SOURCE_DIR" \
+              --device cpu \
+              --max-points 256 \
+            | tee "$META_DIR/cpu-relocated.txt"
+
+          tar -czf "$OUT_DIR/versions.tar.gz" \
+            -C "$WORK_DIR" versions
+
+          conda deactivate
+          unset LD_LIBRARY_PATH
+          export TMPDIR="$WORK_DIR/tmp"
+
+          rm -rf \
+            "$STAGE_DIR" \
+            "$RELOCATED_DIR" \
+            "$BOOTSTRAP_DIR" \
+            "$WORK_DIR/conda-pkgs"
+
+          hash -r
+          echo "::endgroup::"
+
+          echo "::group::Create release parts and checksums"
+
+          cd "$OUT_DIR"
+
+          sha256sum \
+            env.tar.gz source.tar.gz versions.tar.gz activate.sh \
+            > SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+          for archive in env.tar.gz source.tar.gz versions.tar.gz; do
+            split -b 1900M -d -a 3 \
+              "$archive" "$archive.part-"
+            rm "$archive"
+          done
+
+          sha256sum *.part-* activate.sh SHA256SUMS \
+            > PARTS.SHA256
+          sha256sum -c PARTS.SHA256
+
+          du -h ./*
+          printf 'PROJECT_SHA=%s\n' "$PROJECT_SHA"
+          printf 'BUILD_COMPLETE\n'
+
+          echo "::endgroup::"
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          gh --version
+
+          RELEASE_TAG="miro-offline-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          NOTES_FILE="$RUNNER_TEMP/miro-release-notes.txt"
+
+          cat > "$NOTES_FILE" <<'NOTES'
+          MIRO offline installation bundle for Ubuntu 24.04 x86_64.
+
+          Download every *.part-* file, activate.sh, SHA256SUMS,
+          and PARTS.SHA256 from this release into the same directory.
+
+          Verify PARTS.SHA256 before combining the parts.
+          Combine each archive's parts in filename order.
+          Verify SHA256SUMS before extracting.
+
+          Environment: Python 3.11.11, PyTorch 2.5.1+cu121,
+          torchvision 0.20.1+cu121, Lightning 2.4.0, PyG 2.6.1.
+          Project commit: ed2b318b8015f47c47841b18c55a9fea8ef83982.
+
+          Detailed provenance and CPU verification logs:
+          versions.tar.gz.
+          NOTES
+
+          gh release create "$RELEASE_TAG" \
+            "$GITHUB_WORKSPACE"/dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "MIRO offline $RELEASE_TAG" \
+            --notes-file "$NOTES_FILE" \
+            --draft
+
+          gh release edit "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --latest
+
+          RELEASE_URL="$(
+            gh release view "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json url --jq .url
+          )"
+
+          printf 'Release: %s\n' "$RELEASE_URL"
+          printf '[Download offline bundle](%s)\n' "$RELEASE_URL" \
+            >> "$GITHUB_STEP_SUMMARY"
