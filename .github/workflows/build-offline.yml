@@ -213,6 +213,8 @@ jobs:
 
           _miro_dirs=("$MIRO_ROOT/env/lib")
           for _miro_dir in \
+            "$MIRO_ROOT"/env/lib/python*/site-packages/*.libs \
+            "$MIRO_ROOT"/env/lib/python*/site-packages/*/.libs \
             "$MIRO_ROOT"/env/lib/python*/site-packages/torch/lib \
             "$MIRO_ROOT"/env/lib/python*/site-packages/nvidia/*/lib
           do
